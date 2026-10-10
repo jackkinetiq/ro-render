@@ -2,8 +2,6 @@
   "name": "RoRender",
   "servePort": 34873,
   "tree": {
-    "Main": {
-      "$path": "src/Plugin.server.luau"
-    }
+    "$path": "src"
   }
 }
