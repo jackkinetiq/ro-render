@@ -1,0 +1,4 @@
+*.rbxm
+__pycache__/
+*.pyc
+.rojo/

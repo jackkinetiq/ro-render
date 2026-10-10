@@ -1,0 +1,31 @@
+{
+  "name": "RoRender",
+  "servePort": 34873,
+  "tree": {
+    "$className": "Plugin",
+    "Main": {
+      "$path": "src/Plugin.server.luau",
+      "$properties": {
+        "RunContext": "Plugin"
+      }
+    },
+    "CameraRig": {
+      "$path": "src/CameraRig.luau"
+    },
+    "SubjectUtils": {
+      "$path": "src/SubjectUtils.luau"
+    },
+    "PresetStore": {
+      "$path": "src/PresetStore.luau"
+    },
+    "SceneExport": {
+      "$path": "src/SceneExport.luau"
+    },
+    "Bridge": {
+      "$path": "src/Bridge.luau"
+    },
+    "Widget": {
+      "$path": "src/Widget.luau"
+    }
+  }
+}
