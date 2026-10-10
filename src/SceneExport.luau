@@ -203,14 +203,34 @@ local function triangulate(mesh: EditableMesh): CachedMesh?
 	}
 end
 
-local function loadEditableMesh(content: any): EditableMesh?
+local function loadEditableMesh(content: any): (any, string?)
 	local ok, mesh = pcall(function()
 		return AssetService:CreateEditableMeshAsync(content)
 	end)
-	if ok and typeof(mesh) == "Instance" and mesh:IsA("EditableMesh") then
-		return mesh
+	if not ok then
+		return nil, tostring(mesh)
 	end
-	return nil
+	if mesh == nil then
+		return nil, "Studio did not return mesh geometry."
+	end
+	-- EditableMesh is an Object, not an Instance.
+	if typeof(mesh) ~= "Instance" and typeof(mesh) ~= "Object" then
+		return nil, "Studio did not return mesh geometry."
+	end
+	local isMeshOk, isMesh = pcall(function()
+		return (mesh :: any):IsA("EditableMesh")
+	end)
+	if isMeshOk and isMesh then
+		return mesh, nil
+	end
+	return nil, "Studio did not return mesh geometry."
+end
+
+local function meshIsLocked(message: string): boolean
+	local lower = string.lower(message)
+	return string.find(lower, "permission", 1, true) ~= nil
+		or string.find(lower, "fork", 1, true) ~= nil
+		or string.find(lower, "not allowed", 1, true) ~= nil
 end
 
 local function contentFromUri(uri: string): any?
@@ -226,25 +246,29 @@ local function contentFromUri(uri: string): any?
 	return nil
 end
 
-local function readMesh(cache: { [string]: CachedMesh }, key: string, contents: { any }): CachedMesh?
+local function readMesh(cache: { [string]: CachedMesh }, key: string, contents: { any }): (CachedMesh?, string?)
 	local cached = cache[key]
 	if cached then
-		return cached
+		return cached, nil
 	end
+	local lastError: string? = nil
 	for _, content in contents do
 		if content ~= nil then
-			local editable = loadEditableMesh(content)
+			local editable, readErr = loadEditableMesh(content)
 			if editable then
 				local mesh = triangulate(editable)
 				editable:Destroy()
 				if mesh then
 					cache[key] = mesh
-					return mesh
+					return mesh, nil
 				end
+				lastError = "The mesh had no triangles."
+			elseif readErr then
+				lastError = readErr
 			end
 		end
 	end
-	return nil
+	return nil, lastError
 end
 
 local function packMesh(mesh: CachedMesh, transform: (Vector3) -> Vector3): (string, string, string)
@@ -261,6 +285,25 @@ local function packMesh(mesh: CachedMesh, transform: (Vector3) -> Vector3): (str
 		table.insert(flatUv, uv.Y)
 	end
 	return packF32(flatPos), packF32(flatUv), packU32(mesh.indices)
+end
+
+local function downsampleRgba(rgba: string, width: number, height: number, maxEdge: number): (string, number, number)
+	local longEdge = math.max(width, height)
+	if longEdge <= maxEdge or maxEdge < 1 or #rgba ~= width * height * 4 then
+		return rgba, width, height
+	end
+	local newWidth = math.max(1, math.floor(width * maxEdge / longEdge))
+	local newHeight = math.max(1, math.floor(height * maxEdge / longEdge))
+	local src = buffer.fromstring(rgba)
+	local out = buffer.create(newWidth * newHeight * 4)
+	for y = 0, newHeight - 1 do
+		local sourceY = math.min(height - 1, math.floor(y * height / newHeight))
+		for x = 0, newWidth - 1 do
+			local sourceX = math.min(width - 1, math.floor(x * width / newWidth))
+			buffer.copy(out, (y * newWidth + x) * 4, src, (sourceY * width + sourceX) * 4, 4)
+		end
+	end
+	return buffer.tostring(out), newWidth, newHeight
 end
 
 local function pixelsToRgba(pix: buffer, width: number, height: number): string?
@@ -282,7 +325,12 @@ local function pixelsToRgba(pix: buffer, width: number, height: number): string?
 	return nil
 end
 
-local function captureImage(cache: { [string]: TexturePayload }, sourceKey: string, loader: () -> EditableImage?): TexturePayload?
+local function captureImage(
+	cache: { [string]: TexturePayload },
+	sourceKey: string,
+	loader: () -> EditableImage?,
+	maxEdge: number?
+): TexturePayload?
 	local existing = cache[sourceKey]
 	if existing then
 		return existing
@@ -305,6 +353,9 @@ local function captureImage(cache: { [string]: TexturePayload }, sourceKey: stri
 	if not rgba then
 		return nil
 	end
+	if maxEdge ~= nil then
+		rgba, width, height = downsampleRgba(rgba, width, height, maxEdge)
+	end
 	local payload: TexturePayload = {
 		textureRef = "tex-" .. tostring(#cache + 1) .. "-" .. HttpService:GenerateGUID(false):sub(1, 8),
 		width = width,
@@ -317,26 +368,26 @@ local function captureImage(cache: { [string]: TexturePayload }, sourceKey: stri
 	return payload
 end
 
-local function captureUri(cache: { [string]: TexturePayload }, uri: string?): TexturePayload?
+local function captureUri(cache: { [string]: TexturePayload }, uri: string?, maxEdge: number?): TexturePayload?
 	if uri == nil or uri == "" or uri == "rbxassetid://0" then
 		return nil
 	end
-	return captureImage(cache, uri, function()
+	return captureImage(cache, uri .. ":" .. tostring(maxEdge or 0), function()
 		local content = contentFromUri(uri)
 		if content == nil then
 			error("bad uri")
 		end
 		return AssetService:CreateEditableImageAsync(content)
-	end)
+	end, maxEdge)
 end
 
-local function captureContent(cache: { [string]: TexturePayload }, key: string, content: any): TexturePayload?
+local function captureContent(cache: { [string]: TexturePayload }, key: string, content: any, maxEdge: number?): TexturePayload?
 	if content == nil then
 		return nil
 	end
 	return captureImage(cache, key, function()
 		return AssetService:CreateEditableImageAsync(content)
-	end)
+	end, maxEdge)
 end
 
 local function clothingTemplates(model: Model): (string?, string?)
@@ -523,6 +574,176 @@ local function effectsPayload(config: PresetStore.Config): { [string]: any }
 	}
 end
 
+local function colorChannels(color: Color3): { number }
+	return { color.R, color.G, color.B }
+end
+
+local function sequencePeak(sequence: NumberSequence): number
+	local peak = 0
+	for _, keypoint in sequence.Keypoints do
+		peak = math.max(peak, keypoint.Value)
+	end
+	return peak
+end
+
+local function sequenceFloor(sequence: NumberSequence): number
+	local floor = 1
+	for _, keypoint in sequence.Keypoints do
+		floor = math.min(floor, keypoint.Value)
+	end
+	return floor
+end
+
+local function sequenceColor(sequence: ColorSequence): { number }
+	local chosen = sequence.Keypoints[1]
+	for _, keypoint in sequence.Keypoints do
+		if keypoint.Time <= 0.35 then
+			chosen = keypoint
+		end
+	end
+	return colorChannels(chosen.Value)
+end
+
+local function emitterPosition(emitter: ParticleEmitter): Vector3?
+	local parent = emitter.Parent
+	if parent and parent:IsA("Attachment") then
+		return parent.WorldPosition
+	end
+	if parent and parent:IsA("BasePart") then
+		return parent.Position
+	end
+	if parent and parent:IsA("Model") then
+		return parent:GetPivot().Position
+	end
+	return nil
+end
+
+local function particleRecords(model: Model, cache: { [string]: TexturePayload }): { any }
+	local records = {}
+	for _, desc in model:GetDescendants() do
+		if desc:IsA("ParticleEmitter") and desc.Enabled and desc.Rate > 0 and sequenceFloor(desc.Transparency) < 1 then
+			local position = emitterPosition(desc)
+			local size = sequencePeak(desc.Size)
+			if position and size > 0 then
+				local life = (desc.Lifetime.Min + desc.Lifetime.Max) * 0.5
+				local record: { [string]: any } = {
+					name = desc.Name,
+					position = vector3(position),
+					color = sequenceColor(desc.Color),
+					size = size,
+					rate = desc.Rate,
+					life = life,
+					speed = (desc.Speed.Min + desc.Speed.Max) * 0.5,
+					lightEmission = desc.LightEmission,
+					brightness = desc.Brightness,
+					count = math.clamp(math.floor(desc.Rate * life * 0.5 + 0.5), 3, 12),
+				}
+				local image = captureUri(cache, desc.Texture, 256)
+				if image then
+					record.textureRef = image.textureRef
+				end
+				table.insert(records, record)
+			end
+		end
+	end
+	return records
+end
+
+local function effectNumber(instance: Instance, prop: string): number?
+	local ok, value = pcall(function()
+		return (instance :: any)[prop]
+	end)
+	if ok and typeof(value) == "number" then
+		return value
+	end
+	return nil
+end
+
+local function lightingPayload(): { [string]: any }
+	local lighting = game:GetService("Lighting")
+	local sun = Vector3.yAxis
+	pcall(function()
+		sun = lighting:GetSunDirection()
+	end)
+	local payload: { [string]: any } = {
+		ambient = colorChannels(lighting.Ambient),
+		outdoorAmbient = colorChannels(lighting.OutdoorAmbient),
+		brightness = lighting.Brightness,
+		exposure = lighting.ExposureCompensation,
+		sunDirection = vector3(sun),
+		shadowSoftness = lighting.ShadowSoftness,
+		environmentDiffuse = lighting.EnvironmentDiffuseScale,
+		environmentSpecular = lighting.EnvironmentSpecularScale,
+		globalShadows = lighting.GlobalShadows,
+		colorShiftTop = colorChannels(lighting.ColorShift_Top),
+		colorShiftBottom = colorChannels(lighting.ColorShift_Bottom),
+		sunAngularSize = 21,
+		fog = {
+			color = colorChannels(lighting.FogColor),
+			start = lighting.FogStart,
+			["end"] = lighting.FogEnd,
+		},
+	}
+	local sky = lighting:FindFirstChildWhichIsA("Sky")
+	if sky then
+		local angular = effectNumber(sky, "SunAngularSize")
+		if angular then
+			payload.sunAngularSize = angular
+		end
+	end
+	local atmosphere = lighting:FindFirstChildWhichIsA("Atmosphere")
+	if atmosphere then
+		payload.atmosphere = {
+			density = atmosphere.Density,
+			offset = atmosphere.Offset,
+			glare = atmosphere.Glare,
+			haze = atmosphere.Haze,
+			color = colorChannels(atmosphere.Color),
+			decay = colorChannels(atmosphere.Decay),
+		}
+	end
+	local correction = lighting:FindFirstChildWhichIsA("ColorCorrectionEffect")
+	if correction and correction.Enabled then
+		payload.colorCorrection = {
+			brightness = correction.Brightness,
+			contrast = correction.Contrast,
+			saturation = correction.Saturation,
+			tint = colorChannels(correction.TintColor),
+		}
+	end
+	local bloom = lighting:FindFirstChildWhichIsA("BloomEffect")
+	if bloom and bloom.Enabled and bloom.Intensity > 0 then
+		payload.bloom = {
+			intensity = bloom.Intensity,
+			size = bloom.Size,
+			threshold = bloom.Threshold,
+		}
+	end
+	local blur = lighting:FindFirstChildWhichIsA("BlurEffect")
+	if blur and blur.Enabled and blur.Size > 0 then
+		payload.blur = {
+			size = blur.Size,
+		}
+	end
+	local depth = lighting:FindFirstChildWhichIsA("DepthOfFieldEffect")
+	if depth and depth.Enabled then
+		payload.depthOfField = {
+			focusDistance = depth.FocusDistance,
+			inFocusRadius = depth.InFocusRadius,
+			nearIntensity = depth.NearIntensity,
+			farIntensity = depth.FarIntensity,
+		}
+	end
+	local rays = lighting:FindFirstChildWhichIsA("SunRaysEffect")
+	if rays and rays.Enabled and rays.Intensity > 0 then
+		payload.sunRays = {
+			intensity = rays.Intensity,
+			spread = rays.Spread,
+		}
+	end
+	return payload
+end
+
 function SceneExport.build(
 	model: Model,
 	config: PresetStore.Config,
@@ -582,7 +803,7 @@ function SceneExport.build(
 				record.class = kind
 			else
 				local contents, fallbackId, cacheKey = meshContentsFor(desc)
-				local cached = readMesh(meshCache, cacheKey, contents)
+				local cached, meshErr = readMesh(meshCache, cacheKey, contents)
 				if cached then
 					meshCount += 1
 					local meshRef = "mesh-" .. tostring(meshCount)
@@ -615,6 +836,18 @@ function SceneExport.build(
 					record.class = "Mesh"
 					record.meshRef = meshRef
 					record.fitToSize = false
+				elseif meshErr and meshIsLocked(meshErr) then
+					-- A private mesh cannot be downloaded either, and that failure used to cancel the render.
+					local assetNote = if fallbackId then " Asset " .. fallbackId .. "." else ""
+					table.insert(
+						warnings,
+						'"'
+							.. desc.Name
+							.. '" is not shared for reading.'
+							.. assetNote
+							.. " Ask the owner to allow forking. It was sent as a box."
+					)
+					record.class = "Block"
 				elseif fallbackId then
 					record.class = "Mesh"
 					record.meshId = fallbackId
@@ -625,7 +858,9 @@ function SceneExport.build(
 						record.fitToSize = false
 					end
 				else
-					return nil, 'Could not read the mesh on "' .. desc.Name .. '".'
+					local detail = if meshErr then " " .. meshErr else ""
+					table.insert(warnings, 'Could not read the mesh on "' .. desc.Name .. '".' .. detail .. " It was sent as a box.")
+					record.class = "Block"
 				end
 			end
 
@@ -637,6 +872,8 @@ function SceneExport.build(
 		return nil, "The selection has no visible parts."
 	end
 
+	local particles = particleRecords(model, textureCache)
+	local lighting = lightingPayload()
 	local textures: { TexturePayload } = {}
 	for _, payload in textureCache do
 		table.insert(textures, payload)
@@ -658,6 +895,8 @@ function SceneExport.build(
 			fov = config.fov,
 		},
 		effects = effectsPayload(config),
+		lighting = lighting,
+		particles = particles,
 		parts = parts,
 	}
 

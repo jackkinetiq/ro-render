@@ -84,7 +84,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/health":
-            self._send(200, {"ok": True})
+            from .version import ADDON_VERSION
+
+            self._send(200, {"ok": True, "version": ADDON_VERSION})
             return
         if path.startswith("/jobs/"):
             job_id = path[len("/jobs/") :]
@@ -95,7 +97,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if job["status"] == "done":
                 result = job.get("result") or {}
-                self._send(200, {"ok": True, "status": "done", "path": result.get("path")})
+                self._send(200, {"ok": True, "status": "done", "path": result.get("path"), "warnings": result.get("warnings") or []})
                 return
             if job["status"] == "error":
                 self._send(200, {"ok": True, "status": "error", "error": job.get("error") or "Render failed."})
@@ -158,6 +160,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "width": result.get("width"),
                 "height": result.get("height"),
                 "rgbaBase64": base64.b64encode(rgba).decode("ascii"),
+                "warnings": result.get("warnings") or [],
             },
         )
 

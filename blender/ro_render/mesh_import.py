@@ -3,6 +3,7 @@
 import json
 import re
 import struct
+import urllib.error
 import urllib.request
 
 _ASSET = "https://assetdelivery.roblox.com/v1/asset/?id={}"
@@ -47,32 +48,101 @@ def _parse_v1(text: str) -> dict:
     return {"positions": positions, "uvs": uvs, "indices": list(range(verts))}
 
 
-def _parse_binary(body: bytes) -> dict:
-    if len(body) < 12:
+def _version_major(version: str) -> int:
+    number = version.replace("version", "").strip()
+    return int(number.split(".", 1)[0])
+
+
+def _read_vertices(body: bytes, start: int, count: int, stride: int):
+    if count < 0 or stride < 12 or start + count * stride > len(body):
         raise ValueError("Could not parse the mesh file.")
-    header_size, vertex_size, face_size, vertex_count, face_count = struct.unpack_from("<HBBII", body, 0)
-    if header_size < 12 or vertex_size < 12 or face_size < 12:
-        raise ValueError("Could not parse the mesh file.")
-    start = header_size
     positions = []
     uvs = []
-    for index in range(vertex_count):
-        offset = start + index * vertex_size
-        px, py, pz = struct.unpack_from("<fff", body, offset)
-        positions.append((px, py, pz))
-        if vertex_size >= 32:
-            u, v = struct.unpack_from("<ff", body, offset + 24)
-            uvs.append((u, v))
+    for index in range(count):
+        offset = start + index * stride
+        positions.append(struct.unpack_from("<fff", body, offset))
+        if stride >= 32:
+            uvs.append(struct.unpack_from("<ff", body, offset + 24))
         else:
             uvs.append((0.0, 0.0))
-    face_start = start + vertex_count * vertex_size
+    return positions, uvs, start + count * stride
+
+
+def _read_faces(body: bytes, start: int, face_count: int, lod_count: int = 0):
+    if face_count <= 0 or start + face_count * 12 > len(body):
+        raise ValueError("Could not parse the mesh file.")
     indices = []
     for index in range(face_count):
-        offset = face_start + index * face_size
-        indices.extend(struct.unpack_from("<III", body, offset))
+        indices.extend(struct.unpack_from("<III", body, start + index * 12))
+    cursor = start + face_count * 12
+    if lod_count >= 2 and cursor + lod_count * 4 <= len(body):
+        lods = struct.unpack_from("<" + "I" * lod_count, body, cursor)
+        begin = int(lods[0])
+        end = int(lods[1])
+        if 0 <= begin < end <= face_count:
+            indices = indices[begin * 3 : end * 3]
+    if not indices:
+        raise ValueError("Could not parse the mesh file.")
+    return indices
+
+
+def _mesh(positions, uvs, indices) -> dict:
     if not positions or not indices:
         raise ValueError("Could not parse the mesh file.")
     return {"positions": positions, "uvs": uvs, "indices": indices}
+
+
+def _parse_v2(body: bytes, major: int) -> dict:
+    if major >= 3:
+        header_size, vertex_size, _face_size, _lod_size, lod_count, vertex_count, face_count = struct.unpack_from(
+            "<HBBHHII", body, 0
+        )
+    else:
+        header_size, vertex_size, _face_size, vertex_count, face_count = struct.unpack_from("<HBBII", body, 0)
+        lod_count = 0
+    if header_size < 12 or vertex_size < 12:
+        raise ValueError("Could not parse the mesh file.")
+    positions, uvs, cursor = _read_vertices(body, header_size, vertex_count, vertex_size)
+    indices = _read_faces(body, cursor, face_count, lod_count)
+    return _mesh(positions, uvs, indices)
+
+
+def _parse_v4(body: bytes) -> dict:
+    header_size = struct.unpack_from("<H", body, 0)[0]
+    if header_size < 24 or header_size > len(body):
+        raise ValueError("Could not parse the mesh file.")
+    _lod_type, vertex_count, face_count, lod_count, bone_count = struct.unpack_from("<HIIHH", body, 2)
+    positions, uvs, cursor = _read_vertices(body, header_size, vertex_count, 40)
+    if bone_count > 0:
+        cursor += vertex_count * 8
+    indices = _read_faces(body, cursor, face_count, lod_count)
+    return _mesh(positions, uvs, indices)
+
+
+def _parse_chunks(body: bytes) -> dict:
+    position = 0
+    core = None
+    while position + 16 <= len(body):
+        name = body[position : position + 8].split(b"\x00", 1)[0]
+        chunk_version, size = struct.unpack_from("<II", body, position + 8)
+        data_start = position + 16
+        data_end = data_start + size
+        if data_end > len(body):
+            break
+        data = body[data_start:data_end]
+        position = data_end
+        if name == b"COREMESH":
+            core = (chunk_version, data)
+    if core is None:
+        raise ValueError("Could not parse the mesh file.")
+    chunk_version, data = core
+    if chunk_version != 1:
+        raise ValueError("This mesh is compressed, so Studio has to be allowed to read it.")
+    vertex_count = struct.unpack_from("<I", data, 0)[0]
+    positions, uvs, cursor = _read_vertices(data, 4, vertex_count, 40)
+    face_count = struct.unpack_from("<I", data, cursor)[0]
+    indices = _read_faces(data, cursor + 4, face_count, 0)
+    return _mesh(positions, uvs, indices)
 
 
 def parse_mesh_bytes(data: bytes) -> dict:
@@ -80,11 +150,20 @@ def parse_mesh_bytes(data: bytes) -> dict:
         newline = data.find(b"\n")
         version = data[:newline].decode("ascii", "replace").strip()
         body = data[newline + 1 :]
-        if version == "version 1.00":
-            return _parse_v1(body.decode("utf-8", "replace"))
-        if version.startswith("version "):
-            return _parse_binary(body)
-    if data[:1] == b"{" or data[:1] == b"[":
+        major = _version_major(version)
+        if major == 1:
+            mesh = _parse_v1(body.decode("utf-8", "replace"))
+            if version == "version 1.00":
+                mesh["positions"] = [(p[0] * 0.5, p[1] * 0.5, p[2] * 0.5) for p in mesh["positions"]]
+            mesh["uvs"] = [(u, 1.0 - v) for u, v in mesh["uvs"]]
+            return mesh
+        if major in (2, 3):
+            return _parse_v2(body, major)
+        if major in (4, 5):
+            return _parse_v4(body)
+        if major >= 6:
+            return _parse_chunks(body)
+    if data[:1] in (b"{", b"["):
         raise ValueError("Asset host returned a document instead of a mesh.")
     raise ValueError("Could not parse the mesh file.")
 
@@ -96,7 +175,13 @@ def _fetch(url: str) -> bytes:
 
 
 def download_asset(asset_id: str) -> bytes:
-    data = _fetch(_ASSET.format(asset_id))
+    try:
+        data = _fetch(_ASSET.format(asset_id))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(200).decode("utf-8", "replace")
+        if exc.code == 401 or "Authentication required" in detail:
+            raise RuntimeError("Studio is not allowed to read this mesh, and it is not public.") from exc
+        raise RuntimeError(f"Asset host returned HTTP {exc.code}.") from exc
     if data[:1] in (b"{", b"["):
         try:
             payload = json.loads(data.decode("utf-8"))

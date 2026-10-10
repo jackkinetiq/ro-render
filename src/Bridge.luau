@@ -104,10 +104,17 @@ local function request(method: string, path: string, body: string?): (any?, stri
 	return decoded, nil
 end
 
+-- Must match ADDON_VERSION in blender/ro_render/version.py.
+Bridge.ADDON_VERSION = 2
+
 function Bridge.health(): (boolean, string?)
 	local payload, err = request("GET", "/health", nil)
 	if err or typeof(payload) ~= "table" or payload.ok ~= true then
 		return false, err or Bridge.DOWN_MESSAGE
+	end
+	local version = if typeof(payload.version) == "number" then payload.version else 1
+	if version < Bridge.ADDON_VERSION then
+		return false, "Blender is still running an older ro-render add-on. Restart Blender, then start the bridge again."
 	end
 	return true, nil
 end
@@ -140,6 +147,7 @@ export type PreviewImage = {
 	width: number,
 	height: number,
 	rgba: string,
+	warnings: { string },
 }
 
 function Bridge.preview(scene: { [string]: any }): (PreviewImage?, string?)
@@ -150,10 +158,19 @@ function Bridge.preview(scene: { [string]: any }): (PreviewImage?, string?)
 	if typeof(payload.rgbaBase64) ~= "string" or typeof(payload.width) ~= "number" or typeof(payload.height) ~= "number" then
 		return nil, "Preview did not return an image."
 	end
+	local warnings = {}
+	if typeof(payload.warnings) == "table" then
+		for _, message in payload.warnings do
+			if typeof(message) == "string" then
+				table.insert(warnings, message)
+			end
+		end
+	end
 	return {
 		width = payload.width,
 		height = payload.height,
 		rgba = Bridge.base64Decode(payload.rgbaBase64),
+		warnings = warnings,
 	}, nil
 end
 
@@ -172,6 +189,7 @@ export type JobState = {
 	status: string,
 	path: string?,
 	error: string?,
+	warnings: { string },
 }
 
 function Bridge.job(jobId: string): (JobState?, string?)
@@ -179,10 +197,19 @@ function Bridge.job(jobId: string): (JobState?, string?)
 	if err or typeof(payload) ~= "table" then
 		return nil, err or "Lost contact with the Blender bridge."
 	end
+	local warnings = {}
+	if typeof(payload.warnings) == "table" then
+		for _, message in payload.warnings do
+			if typeof(message) == "string" then
+				table.insert(warnings, message)
+			end
+		end
+	end
 	return {
 		status = if typeof(payload.status) == "string" then payload.status else "error",
 		path = if typeof(payload.path) == "string" then payload.path else nil,
 		error = if typeof(payload.error) == "string" then payload.error else nil,
+		warnings = warnings,
 	}, nil
 end
 

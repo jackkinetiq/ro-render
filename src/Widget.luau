@@ -971,7 +971,7 @@ function Widget.create(plugin: Plugin, dock: DockWidgetPluginGui): WidgetHandle
 					finish(tostring(showErr))
 					return
 				end
-				finish("Preview ready." .. warningText(exported.warnings))
+				finish("Preview ready." .. warningText(exported.warnings) .. warningText(image.warnings))
 				return
 			end
 
@@ -988,7 +988,7 @@ function Widget.create(plugin: Plugin, dock: DockWidgetPluginGui): WidgetHandle
 					return
 				end
 				if state.status == "done" then
-					finish("Saved: " .. (state.path or fileName) .. warningText(exported.warnings))
+					finish("Saved: " .. (state.path or fileName) .. warningText(exported.warnings) .. warningText(state.warnings))
 					return
 				end
 				if state.status == "error" then
